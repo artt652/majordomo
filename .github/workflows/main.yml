@@ -140,13 +140,25 @@ jobs:
           # Регистрируем PHPCompatibility как стандарт PHPCS
           vendor/bin/phpcs --config-set installed_paths vendor/phpcompatibility/php-compatibility
 
+          # Workaround: баг в RemovedIconvEncodingSniff — под PHP 8.x runtime снифф
+          # передаёт строку вместо array во второй аргумент addWarning(), что вызывает
+          # TypeError в vsprintf(). Исключаем снифф через phpcs.xml чтобы не дублировать
+          # флаг --exclude в каждом вызове phpcs ниже.
+          # Файл phpcs.xml создаётся только если его нет в репозитории.
+          if [ ! -f "phpcs.xml" ] && [ ! -f ".phpcs.xml" ]; then
+            printf '%s\n'               '<?xml version="1.0"?>'               '<ruleset name="Majordomo">'               '  <rule ref="PHPCompatibility">'               '    <!-- Workaround: RemovedIconvEncodingSniff crashes under PHP 8.x runtime'               '         due to a bug in phpcompatibility/php-compatibility:'               '         passes string instead of array to vsprintf() via addWarning().'               '         Remove this exclusion when upstream fixes the sniff. -->'               '    <exclude name="PHPCompatibility.ParameterValues.RemovedIconvEncoding"/>'               '  </rule>'               '</ruleset>'               > phpcs.xml
+            echo "Created temporary phpcs.xml with RemovedIconvEncoding exclusion"
+          else
+            echo "phpcs.xml already exists — skipping creation"
+          fi
+
       # --- Проверка совместимости с PHP 7.4 (информационно) ---
       - name: Check compatibility with PHP 7.4
         continue-on-error: true
         run: |
           echo "=== Checking PHP 7.4 compatibility ==="
           vendor/bin/phpcs \
-            --standard=PHPCompatibility \
+            --standard=phpcs.xml \
             --runtime-set testVersion 7.4 \
             --extensions=php \
             --ignore=vendor/,cms/cached/,cms/saverestore/temp/ \
@@ -161,7 +173,7 @@ jobs:
         run: |
           echo "=== Checking PHP 8.0 compatibility ==="
           vendor/bin/phpcs \
-            --standard=PHPCompatibility \
+            --standard=phpcs.xml \
             --runtime-set testVersion 8.0 \
             --extensions=php \
             --ignore=vendor/,cms/cached/,cms/saverestore/temp/ \
@@ -176,7 +188,7 @@ jobs:
         run: |
           echo "=== Checking PHP 8.5 compatibility ==="
           vendor/bin/phpcs \
-            --standard=PHPCompatibility \
+            --standard=phpcs.xml \
             --runtime-set testVersion 8.5 \
             --extensions=php \
             --ignore=vendor/,cms/cached/,cms/saverestore/temp/ \
@@ -192,7 +204,7 @@ jobs:
         run: |
           echo "=== Final compatibility gate: PHP 7.4 - 8.5 ==="
           vendor/bin/phpcs \
-            --standard=PHPCompatibility \
+            --standard=phpcs.xml \
             --runtime-set testVersion 7.4-8.5 \
             --extensions=php \
             --ignore=vendor/,cms/cached/,cms/saverestore/temp/ \
@@ -703,7 +715,7 @@ jobs:
             exit 1
           else
             echo "RESULT: No critical errors. Review warnings in jobs above."
-          fi"
+          fi
 
   # ============================================================
   # JOB 5: Расширенные проверки качества кода
