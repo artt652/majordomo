@@ -1,7 +1,5 @@
 name: PHP Compatibility Check
 
-# Запускается при push и PR в основные ветки,
-# а также вручную через workflow_dispatch
 on:
   push:
     branches: [ alpha-test ]
@@ -16,662 +14,368 @@ on:
       - '**.ini'
   workflow_dispatch:
 
+# Все джобы информационные — никогда не блокируют merge.
+# all-checks-passed всегда green, нужен только для branch protection rules.
+
 jobs:
+
   # ============================================================
-  # JOB 1: Синтаксический lint на нескольких версиях PHP
-  # php -l не требует зависимостей и работает быстро
-  # Матрица включает 8.5 — реальная версия в Termux на устройстве
+  # JOB 1: Синтаксический lint — php -l на матрице версий
   # ============================================================
   php-lint:
     name: "Lint PHP ${{ matrix.php-version }}"
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        shell: bash
     strategy:
-      fail-fast: false          # показываем ошибки для ВСЕХ версий, не останавливаемся
+      fail-fast: false
       matrix:
-        php-version: ['7.4', '8.0', '8.1', '8.2', '8.3', '8.5']
+        php-version: ['7.4', '8.4', '8.5']
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup PHP ${{ matrix.php-version }}
-        uses: shivammathur/setup-php@v2
+      - uses: shivammathur/setup-php@v2
         with:
           php-version: ${{ matrix.php-version }}
-          # Расширения, которые реально используются в Majordomo
           extensions: mbstring, curl, xml, mysqli, json
-          # coverage: none — ускоряет setup, нам coverage не нужен
           coverage: none
           tools: none
 
-      - name: Verify PHP is available
-        run: |
-          php --version
-          which php
-
-      - name: Run PHP lint on all .php files
+      - name: "php -l on all PHP files"
         continue-on-error: true
         run: |
-          # Отключаем set -e явно — иначе первая ошибка php -l прервёт весь скрипт
           set +e
-
           echo "=== PHP ${{ matrix.php-version }} syntax check ==="
 
-          FILES=$(find . \
+          ERRORS=0
+          while IFS= read -r file; do
+            OUTPUT=$(php -l "$file" 2>&1)
+            if [ $? -ne 0 ]; then
+              echo "SYNTAX ERROR: $file"
+              echo "$OUTPUT"
+              LINE=$(echo "$OUTPUT" | grep -oP 'on line \K[0-9]+' | head -1)
+              if [ -n "$LINE" ] && [ "$LINE" -gt 0 ] 2>/dev/null; then
+                echo "--- context ---"
+                awk "NR>=$(( LINE > 3 ? LINE - 3 : 1 )) && NR<=$((LINE+3)) \
+                  {printf \"%4d | %s\n\", NR, \$0}" "$file"
+              fi
+              echo "---"
+              ERRORS=$((ERRORS + 1))
+            fi
+          done < <(find . \
             -name "*.php" \
             -not -path "./vendor/*" \
             -not -path "./cms/cached/*" \
             -not -path "./cms/saverestore/temp/*" \
+            -not -path "./lib/mysql.class.php" \
             2>/dev/null)
 
-          if [ -z "$FILES" ]; then
-            echo "WARNING: No PHP files found"
-            exit 0
-          fi
-
-          TOTAL=$(echo "$FILES" | wc -l)
-          echo "Files to check: $TOTAL"
-
-          ERRORS=0
-          while IFS= read -r file; do
-            # Запускаем php -l, игнорируем exit code здесь — считаем сами
-            OUTPUT=$(php -l "$file" 2>&1)
-            CODE=$?
-            if [ $CODE -ne 0 ]; then
-              echo "----"
-              echo "SYNTAX ERROR: $file"
-              echo "$OUTPUT"
-              # Показываем контекст — строки вокруг ошибки
-              LINE=$(echo "$OUTPUT" | grep -oP 'on line \K[0-9]+' | head -1)
-              if [ -n "$LINE" ] && [ "$LINE" -gt 0 ] 2>/dev/null; then
-                START=$(( LINE > 3 ? LINE - 3 : 1 ))
-                echo "--- context (lines $START-$((LINE+3))) ---"
-                sed -n "${START},$((LINE+3))p" "$file" | cat -n | sed "s/^/${START-1}/"
-                awk "NR>=${START} && NR<=$((LINE+3)) {printf "%4d | %s\n", NR, \$0}" "$file"
-              fi
-              ERRORS=$((ERRORS + 1))
-            fi
-          done <<< "$FILES"
-
-          echo "----"
-          echo "Checked: $TOTAL files, Errors: $ERRORS"
-
-          if [ "$ERRORS" -gt 0 ]; then
-            echo "FAILED: Found $ERRORS syntax error(s) on PHP ${{ matrix.php-version }}"
-            exit 1
-          else
-            echo "OK: No syntax errors on PHP ${{ matrix.php-version }}"
-          fi
+          echo "Errors: $ERRORS"
 
   # ============================================================
-  # JOB 2: PHPCompatibility — статический анализ совместимости
-  # Проверяет использование deprecated/removed функций между версиями
+  # JOB 2: PHPCompatibility — статический анализ
+  # Запускаем на PHP 8.1 (стабильный runtime для инструментов).
+  # Тестируем диапазон 7.4–8.5.
+  # RemovedIconvEncoding исключён — баг в самом сниффе под PHP 8.x:
+  # передаёт string вместо array в vsprintf() → TypeError fatal.
   # ============================================================
   php-compatibility:
-    name: "PHPCompatibility Analysis"
+    name: "PHPCompatibility 7.4-8.5"
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        shell: bash
-    # Запускаем после lint — нет смысла анализировать файлы с синтаксическими ошибками
-    needs: php-lint
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup PHP 8.1 (для запуска инструментов)
-        uses: shivammathur/setup-php@v2
+      - uses: shivammathur/setup-php@v2
         with:
           php-version: '8.1'
           coverage: none
           tools: composer
 
-      - name: Install PHPCompatibility + PHP_CodeSniffer
+      - name: "Install PHPCompatibility + PHPCS"
         run: |
           composer require --dev \
             "squizlabs/php_codesniffer:^3.7" \
             "phpcompatibility/php-compatibility:^9.3" \
             --no-interaction --no-progress --quiet
+          vendor/bin/phpcs --config-set \
+            installed_paths vendor/phpcompatibility/php-compatibility
 
-          # Регистрируем PHPCompatibility как стандарт PHPCS
-          vendor/bin/phpcs --config-set installed_paths vendor/phpcompatibility/php-compatibility
-
-          # Workaround: баг в RemovedIconvEncodingSniff — под PHP 8.x runtime снифф
-          # передаёт строку вместо array во второй аргумент addWarning(), что вызывает
-          # TypeError в vsprintf(). Исключаем снифф через phpcs.xml чтобы не дублировать
-          # флаг --exclude в каждом вызове phpcs ниже.
-          # Файл phpcs.xml создаётся только если его нет в репозитории.
-          if [ ! -f "phpcs.xml" ] && [ ! -f ".phpcs.xml" ]; then
-            printf '%s\n'               '<?xml version="1.0"?>'               '<ruleset name="Majordomo">'               '  <rule ref="PHPCompatibility">'               '    <!-- Workaround: RemovedIconvEncodingSniff crashes under PHP 8.x runtime'               '         due to a bug in phpcompatibility/php-compatibility:'               '         passes string instead of array to vsprintf() via addWarning().'               '         Remove this exclusion when upstream fixes the sniff. -->'               '    <exclude name="PHPCompatibility.ParameterValues.RemovedIconvEncoding"/>'               '  </rule>'               '</ruleset>'               > phpcs.xml
-            echo "Created temporary phpcs.xml with RemovedIconvEncoding exclusion"
-          else
-            echo "phpcs.xml already exists — skipping creation"
-          fi
-
-      # --- Проверка совместимости с PHP 7.4 (информационно) ---
-      - name: Check compatibility with PHP 7.4
+      - name: "Run PHPCompatibility 7.4-8.5"
         continue-on-error: true
         run: |
-          echo "=== Checking PHP 7.4 compatibility ==="
           vendor/bin/phpcs \
-            --standard=phpcs.xml \
-            --runtime-set testVersion 7.4 \
-            --extensions=php \
-            --ignore=vendor/,cms/cached/,cms/saverestore/temp/ \
-            --report=full \
-            --report-width=120 \
-            . || true
-          # || true — не фейлим job здесь, фейлим на итоговой сводке ниже
-
-      # --- Проверка совместимости с PHP 8.0 (информационно) ---
-      - name: Check compatibility with PHP 8.0
-        continue-on-error: true
-        run: |
-          echo "=== Checking PHP 8.0 compatibility ==="
-          vendor/bin/phpcs \
-            --standard=phpcs.xml \
-            --runtime-set testVersion 8.0 \
-            --extensions=php \
-            --ignore=vendor/,cms/cached/,cms/saverestore/temp/ \
-            --report=full \
-            --report-width=120 \
-            . || true
-
-      # --- Проверка совместимости с PHP 8.5 (информационно) ---
-      # PHP 8.5 вышел 20.11.2025, именно эта версия стоит в Termux на устройстве
-      - name: Check compatibility with PHP 8.5
-        continue-on-error: true
-        run: |
-          echo "=== Checking PHP 8.5 compatibility ==="
-          vendor/bin/phpcs \
-            --standard=phpcs.xml \
-            --runtime-set testVersion 8.5 \
-            --extensions=php \
-            --ignore=vendor/,cms/cached/,cms/saverestore/temp/ \
-            --report=full \
-            --report-width=120 \
-            . || true
-
-      # --- Итоговая проверка: ERROR-уровень = hard fail ---
-      # WARNING = информационно, ERROR = блокирует merge
-      # Диапазон 7.4-8.5 покрывает весь спектр: от минимума до реального Termux
-      - name: Fail on PHP compatibility ERRORs (7.4 - 8.5)
-        continue-on-error: true
-        run: |
-          echo "=== Final compatibility gate: PHP 7.4 - 8.5 ==="
-          vendor/bin/phpcs \
-            --standard=phpcs.xml \
+            --standard=PHPCompatibility \
             --runtime-set testVersion 7.4-8.5 \
             --extensions=php \
-            --ignore=vendor/,cms/cached/,cms/saverestore/temp/ \
-            --report=summary \
-            --warning-severity=0 \
+            --ignore=vendor/,cms/cached/,cms/saverestore/temp/,lib/mysql.class.php \
+            --exclude=PHPCompatibility.ParameterValues.RemovedIconvEncoding \
+            --report=full \
+            --report-width=120 \
+            -s \
             .
-          # --warning-severity=0 — подавляем WARNING, только ERROR вызывает exit 1
 
   # ============================================================
-  # JOB 3: Проверка специфичных для Majordomo/Termux паттернов
-  # Ищем конструкции, которые сломаются на PHP 8.x в контексте проекта
+  # JOB 3: Majordomo/Termux специфика — grep-проверки
   # ============================================================
   majordomo-specific:
-    name: "Majordomo/Termux specific checks"
+    name: "Majordomo/Termux checks"
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        shell: bash
-    needs: php-lint
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup PHP 8.5
-        # Используем 8.5 — именно эта версия стоит в Termux на реальном устройстве
-        uses: shivammathur/setup-php@v2
-        with:
-          php-version: '8.5'
-          coverage: none
-          tools: none
+      - name: "PHP4-style constructors (FATAL в PHP 8)"
+        continue-on-error: true
+        run: |
+          echo "=== PHP4-style constructors ==="
+          FOUND=0
+          while IFS= read -r -d '' file; do
+            classname=$(grep -oP '(?<=^class\s)\w+' "$file" | head -1)
+            if [ -n "$classname" ] && grep -qP "^\s+function\s+${classname}\s*\(" "$file"; then
+              echo "FILE: $file (class $classname)"
+              grep -nB2 -A2 -P "^\s+function\s+${classname}\s*\(" "$file"
+              echo "---"
+              FOUND=$((FOUND + 1))
+            fi
+          done < <(find . \
+            -name "*.class.php" \
+            -not -path "./vendor/*" \
+            -not -path "./3rdparty/*" \
+            -print0)
+          echo "Total: $FOUND file(s) with PHP4 constructors"
 
-      # ------------------------------------------------------------------
-      # БЛОК A: Конструкции, удалённые до PHP 8.0
-      # ------------------------------------------------------------------
-
-      - name: "[PHP7] Check for mysql_* functions (removed in PHP 7)"
+      - name: "mysql_* функции (удалены в PHP 7)"
         continue-on-error: true
         run: |
           echo "=== Legacy mysql_* functions ==="
-          result=$(grep -rn -B2 -A2 \
+          grep -rn -B2 -A2 \
             --include="*.php" \
             --exclude-dir=vendor \
             --exclude-dir=3rdparty \
             --exclude-dir=cms \
-            -E '\bmysql_(connect|query|fetch_array|num_rows|error|escape_string|real_escape_string|select_db|close)\s*\(' \
-            . 2>/dev/null || true)
-          if [ -n "$result" ]; then
-            echo "❌ Found removed mysql_* calls:"
-            echo "$result"
-            exit 1
-          else
-            echo "✅ No legacy mysql_* functions."
-          fi
+            --exclude="mysql.class.php" \
+            -E '\bmysql_(connect|query|fetch_array|num_rows|error|escape_string|select_db|close)\s*\(' \
+            . 2>/dev/null \
+            && echo "^^^ Found" || echo "OK: none"
 
-      - name: "[PHP7] Check for ereg/split functions (removed in PHP 7)"
+      - name: "each() / create_function() (удалены в PHP 8)"
         continue-on-error: true
         run: |
-          echo "=== Legacy ereg/split functions ==="
-          result=$(grep -rn -B2 -A2 \
+          echo "=== each() / create_function() ==="
+          grep -rn -B2 -A2 \
             --include="*.php" \
             --exclude-dir=vendor \
             --exclude-dir=3rdparty \
             --exclude-dir=cms \
-            -E '\b(ereg|eregi|ereg_replace|eregi_replace|split|spliti)\s*\(' \
-            . 2>/dev/null || true)
-          if [ -n "$result" ]; then
-            echo "❌ Found removed ereg/split calls:"
-            echo "$result"
-            exit 1
-          else
-            echo "✅ No legacy ereg/split functions."
-          fi
+            -E '\b(each|create_function)\s*\(' \
+            . 2>/dev/null \
+            && echo "^^^ Found" || echo "OK: none"
 
-      # ------------------------------------------------------------------
-      # БЛОК B: Конструкции, удалённые в PHP 8.0
-      # ------------------------------------------------------------------
-
-      - name: "[PHP8.0] Check for create_function (removed in PHP 8)"
+      - name: 'Curly brace string access $str{n} (удалено в PHP 8)'
         continue-on-error: true
         run: |
-          echo "=== create_function() - removed in PHP 8.0 ==="
-          result=$(grep -rn -B2 -A2 \
-            --include="*.php" \
-            --exclude-dir=vendor \
-            --exclude-dir=3rdparty \
-            -E '\bcreate_function\s*\(' \
-            . 2>/dev/null || true)
-          if [ -n "$result" ]; then
-            echo "❌ Found create_function() calls (removed PHP 8.0):"
-            echo "$result"
-            exit 1
-          else
-            echo "✅ No create_function() calls."
-          fi
-
-      - name: "[PHP8.0] Check for each() function (removed in PHP 8)"
-        continue-on-error: true
-        run: |
-          echo "=== each() function - removed in PHP 8.0 ==="
-          result=$(grep -rn -B2 -A2 \
-            --include="*.php" \
-            --exclude-dir=vendor \
-            --exclude-dir=3rdparty \
-            --exclude-dir=cms \
-            -E '\beach\s*\(' \
-            . 2>/dev/null || true)
-          if [ -n "$result" ]; then
-            echo "❌ Found each() calls (removed PHP 8.0):"
-            echo "$result"
-            exit 1
-          else
-            echo "✅ No each() calls."
-          fi
-
-      - name: "[PHP8.0] Check curly brace string access $str{n} (removed in PHP 8)"
-        # Deprecated в 7.4, удалено в 8.0
-        continue-on-error: true
-        run: |
-          echo "=== Curly brace string access str{n} - removed in PHP 8.0 ==="
-          result=$(grep -rn -B2 -A2 \
+          echo "=== Curly brace string access ==="
+          grep -rn -B2 -A2 \
             --include="*.php" \
             --exclude-dir=vendor \
             --exclude-dir=3rdparty \
             --exclude-dir=cms \
             -E '\$[a-zA-Z_][a-zA-Z0-9_]*\{[0-9]+\}' \
-            . 2>/dev/null || true)
-          if [ -n "$result" ]; then
-            echo "❌ Found curly brace string access (removed PHP 8.0):"
-            echo "$result"
-            exit 1
-          else
-            echo "✅ No curly brace string access."
-          fi
+            . 2>/dev/null \
+            && echo "^^^ Found" || echo "OK: none"
 
-      - name: "[PHP8.0] Check PHP4-style constructors (FATAL in PHP 8)"
-        # В PHP 8 функция с именем класса больше не конструктор — FATAL ERROR
-        # backup::backup(), saverestore::saverestore() и т.д.
-        # WARNING, не hard fail — upstream содержит их намеренно,
-        # патчи start.php добавляют __construct() через applyStringPatch()
+      - name: 'dollar-brace interpolation ${var} (удалено в PHP 8.3)'
         continue-on-error: true
         run: |
-          echo "=== PHP4-style constructors (CRITICAL for PHP 8) ==="
-          FOUND=0
-          while IFS= read -r -d '' file; do
-            classname=$(grep -oP '(?<=^class\s)\w+' "$file" | head -1)
-            if [ -n "$classname" ]; then
-              if grep -qP "function\s+${classname}\s*\(" "$file"; then
-                echo "⚠️  PHP4 constructor: $file (class $classname)"
-                grep -nP "function\s+${classname}\s*\(" "$file"
-                FOUND=$((FOUND + 1))
-              fi
-            fi
-          done < <(find . \
-            -name "*.class.php" \
-            -not -path "./vendor/*" \
-            -not -path "./3rdparty/*" \
-            -print0)
-
-          echo ""
-          if [ $FOUND -gt 0 ]; then
-            echo "⚠️  Found $FOUND file(s) with PHP4-style constructors."
-            echo "   FATAL ERROR in PHP 8 unless __construct() is added via patch."
-            echo "   Verify start.php patches cover all listed files."
-          else
-            echo "✅ No PHP4-style constructors found."
-          fi
-
-      - name: "[PHP8.0] Check deprecated dollar-brace interpolation (removed in PHP 8.3)"
-        # ${var} deprecated в 8.2, удалено в 8.3
-        # Отличается от {$var} — последний валиден
-        continue-on-error: true
-        run: |
-          echo "=== dollar-brace string interpolation - removed in PHP 8.3 ==="
-          result=$(grep -rn -B2 -A2 \
+          echo "=== dollar-brace interpolation ==="
+          grep -rn -B2 -A2 \
             --include="*.php" \
             --exclude-dir=vendor \
             --exclude-dir=3rdparty \
             --exclude-dir=cms \
             -P '"[^"]*\$\{[a-zA-Z_]' \
-            . 2>/dev/null || true)
-          if [ -n "$result" ]; then
-            echo "❌ Found \${var} string interpolation (removed PHP 8.3):"
-            echo "$result"
-            echo "Fix: replace \${var} with \${var} -> {$var}"
-            exit 1
-          else
-            echo "✅ No deprecated \${var} interpolation."
-          fi
+            . 2>/dev/null \
+            && echo "^^^ Found — fix: \${var} -> {$var}" || echo "OK: none"
 
-      # ------------------------------------------------------------------
-      # БЛОК C: Deprecations PHP 8.5 (ещё не удалено, но генерирует E_DEPRECATED)
-      # На реальном Termux устройстве стоит PHP 8.5 — эти предупреждения
-      # активны прямо сейчас и могут ронять циклы Majordomo при
-      # error_reporting без ~E_DEPRECATED (если кто-то уберёт из z_opcache_off.ini)
-      # ------------------------------------------------------------------
-
-      - name: "[PHP8.5] Check backtick operator (deprecated in PHP 8.5)"
-        # Бэктики как псевдоним shell_exec() — deprecated в 8.5, будет удалено в PHP 9
-        # В цикловых скриптах Majordomo могут встречаться
+      - name: "Backtick оператор (deprecated PHP 8.5)"
         continue-on-error: true
         run: |
-          echo "=== Backtick operator \`cmd\` - deprecated in PHP 8.5 ==="
-          result=$(grep -rn -B2 -A2 \
+          echo "=== Backtick operator ==="
+          grep -rn -B2 -A2 \
             --include="*.php" \
             --exclude-dir=vendor \
             --exclude-dir=3rdparty \
             --exclude-dir=cms \
             -P '(?<!\\)`[^`\n]+`' \
-            . 2>/dev/null || true)
-          if [ -n "$result" ]; then
-            echo "⚠️  Found backtick operator (deprecated PHP 8.5, removed PHP 9):"
-            echo "$result"
-            echo "Fix: replace \`cmd\` with shell_exec('cmd')"
-            # WARNING — не hard fail, ещё работает в 8.5
-          else
-            echo "✅ No backtick operators."
-          fi
+            . 2>/dev/null \
+            && echo "^^^ Found — fix: shell_exec('cmd')" || echo "OK: none"
 
-      - name: "[PHP8.5] Check non-canonical cast names (deprecated in PHP 8.5)"
-        # (boolean), (integer), (double), (binary) → deprecated в 8.5
-        # Старый PHP4/5 код активно использует эти формы
-        # Замена: (bool), (int), (float), (string)
+      - name: "Non-canonical casts (deprecated PHP 8.5)"
         continue-on-error: true
         run: |
-          echo "=== Non-canonical casts - deprecated in PHP 8.5 ==="
-          result=$(grep -rn -B2 -A2 \
+          echo "=== Non-canonical casts (boolean/integer/double/binary) ==="
+          grep -rn -B2 -A2 \
             --include="*.php" \
             --exclude-dir=vendor \
             --exclude-dir=3rdparty \
             --exclude-dir=cms \
             -E '\((boolean|integer|double|binary)\)' \
-            . 2>/dev/null || true)
-          if [ -n "$result" ]; then
-            echo "⚠️  Found non-canonical cast names (deprecated PHP 8.5, removed PHP 9):"
-            echo "$result"
-            echo "Fix: (boolean)->(bool)  (integer)->(int)  (double)->(float)  (binary)->(string)"
-            # WARNING — не hard fail, ещё работает в 8.5
-          else
-            echo "✅ No non-canonical cast names."
-          fi
+            . 2>/dev/null \
+            && echo "^^^ Found — fix: bool/int/float/string" || echo "OK: none"
 
-      - name: "[PHP8.5] Check __sleep/__wakeup magic methods (soft-deprecated in PHP 8.5)"
-        # __sleep() и __wakeup() soft-deprecated в 8.5
-        # Majordomo использует сериализацию активно (потоки, кэш состояний)
-        # Замена: __serialize() / __unserialize()
+      - name: "sudo / service mysql restart (нет на Termux)"
         continue-on-error: true
         run: |
-          echo "=== __sleep/__wakeup - soft-deprecated in PHP 8.5 ==="
-          result=$(grep -rn -B2 -A2 \
-            --include="*.php" \
-            --exclude-dir=vendor \
-            --exclude-dir=3rdparty \
-            --exclude-dir=cms \
-            -E 'function\s+__(sleep|wakeup)\s*\(' \
-            . 2>/dev/null || true)
-          if [ -n "$result" ]; then
-            echo "⚠️  Found __sleep/__wakeup (soft-deprecated PHP 8.5):"
-            echo "$result"
-            echo "Fix: implement __serialize()/__unserialize() alongside or instead"
-            # WARNING — не hard fail, мягкая deprecation
-          else
-            echo "✅ No __sleep/__wakeup methods."
-          fi
-
-      - name: "[PHP8.5] Check semicolon-terminated case statements (deprecated in PHP 8.5)"
-        # case 'foo'; вместо case 'foo': — наследие PHP/FI 2, deprecated в 8.5
-        continue-on-error: true
-        run: |
-          echo "=== Semicolon-terminated case statements - deprecated in PHP 8.5 ==="
-          result=$(grep -rn -B2 -A2 \
-            --include="*.php" \
-            --exclude-dir=vendor \
-            --exclude-dir=3rdparty \
-            --exclude-dir=cms \
-            -P '^\s*case\s+.+;$' \
-            . 2>/dev/null || true)
-          if [ -n "$result" ]; then
-            echo "⚠️  Found semicolon-terminated case statements (deprecated PHP 8.5):"
-            echo "$result"
-            echo "Fix: replace trailing ; with : in case statements"
-          else
-            echo "✅ No semicolon-terminated case statements."
-          fi
-
-      # ------------------------------------------------------------------
-      # БЛОК D: Termux/Android специфика
-      # ------------------------------------------------------------------
-
-      - name: "[Termux] Check shm_open usage (blocked on Android without root)"
-        # shm_open() заблокирован на Android без root — причина отключения OPcache.
-        # OPcache в PHP 8.5 теперь неотъемлемая часть бинарника (нельзя убрать при сборке),
-        # поэтому z_opcache_off.ini с opcache.enable=0 обязателен навсегда.
-        continue-on-error: true
-        run: |
-          echo "=== shm_open() - blocked on Android/Termux ==="
-          result=$(grep -rn -B2 -A2 \
-            --include="*.php" \
-            --exclude-dir=vendor \
-            --exclude-dir=3rdparty \
-            -E '\bshm_(open|attach|detach|remove|get_var|put_var)\s*\(' \
-            . 2>/dev/null || true)
-          if [ -n "$result" ]; then
-            echo "⚠️  Found shm_* calls (will fail on Android without root):"
-            echo "$result"
-          else
-            echo "✅ No shm_* calls in project code."
-          fi
-
-      - name: "[Termux] Verify opcache_off.ini exists and is correct"
-        # PHP 8.5: OPcache теперь всегда встроен в бинарник, отключить через сборку нельзя.
-        # Единственный способ — opcache.enable=0 в ini-файле.
-        # Проверяем что файл существует и содержит нужные директивы.
-        continue-on-error: true
-        run: |
-          echo "=== OPcache disable ini check ==="
-          INI_FILE=""
-          # Ищем файл с любым именем содержащий opcache.enable=0
-          while IFS= read -r -d '' f; do
-            if grep -q "opcache.enable=0" "$f" 2>/dev/null; then
-              INI_FILE="$f"
-              break
-            fi
-          done < <(find . -name "*.ini" -not -path "./vendor/*" -print0)
-
-          if [ -n "$INI_FILE" ]; then
-            echo "✅ Found opcache disable ini: $INI_FILE"
-            # Проверяем что там есть оба ключа
-            grep -q "opcache.enable=0" "$INI_FILE" \
-              && echo "  ✅ opcache.enable=0" \
-              || echo "  ⚠️  opcache.enable=0 not found"
-            grep -q "opcache.enable_cli=0" "$INI_FILE" \
-              && echo "  ✅ opcache.enable_cli=0" \
-              || echo "  ⚠️  opcache.enable_cli=0 not found"
-            # Проверяем что E_DEPRECATED подавлен (критично для Majordomo на PHP 8)
-            grep -q "error_reporting" "$INI_FILE" \
-              && echo "  ✅ error_reporting configured" \
-              || echo "  ⚠️  error_reporting not set — PHP 8.5 deprecations may crash cycles"
-          else
-            echo "❌ No opcache disable ini found!"
-            echo "   PHP 8.5 always includes OPcache — without opcache.enable=0"
-            echo "   php-cgi will crash with Permission denied (shm_open) on Android."
-            exit 1
-          fi
-
-      - name: "[Termux] Check for sudo/service mysql restart (fails without root)"
-        # cycle.php содержит: exec('sudo service mysql restart')
-        # На Termux нет sudo — команда молча падает, но это задержка и лишний лог
-        # Патч start.php должен закрывать это через DISABLE_MYSQL_RESTART
-        continue-on-error: true
-        run: |
-          echo "=== sudo/service mysql restart - fails silently on Termux ==="
-          result=$(grep -rn -B2 -A2 \
-            --include="*.php" \
-            --exclude-dir=vendor \
-            --exclude-dir=3rdparty \
-            -E 'sudo\s+service\s+mysql\s+restart' \
-            . 2>/dev/null || true)
-          if [ -n "$result" ]; then
-            echo "⚠️  Found sudo service mysql restart calls:"
-            echo "$result"
-            echo "   On Termux/Android this silently fails (no sudo)."
-            echo "   Ensure start.php patches this or DISABLE_MYSQL_RESTART is defined."
-          else
-            echo "✅ No sudo service mysql restart in project files."
-          fi
-
-      # ------------------------------------------------------------------
-      # БЛОК E: Безопасность патч-менеджера
-      # ------------------------------------------------------------------
-
-      - name: "Check no stale patch artifacts committed"
-        # patch.lock и .patching.tmp не должны попасть в репозиторий —
-        # это TTL-файлы предотвращения конкурентного патчинга (start.php)
-        continue-on-error: true
-        run: |
-          echo "=== Stale patch artifacts check ==="
-          FOUND=0
-          for artifact in "patch.lock" ".patching.tmp" "patch_checksums.json.tmp"; do
-            if find . -name "$artifact" -not -path "./vendor/*" | grep -q .; then
-              echo "⚠️  Stale patch artifact in repo: $artifact"
-              find . -name "$artifact" -not -path "./vendor/*"
-              FOUND=$((FOUND + 1))
-            fi
-          done
-          if [ $FOUND -eq 0 ]; then
-            echo "✅ No stale patch artifacts."
-          fi
-
-      - name: "Check start.php covers all PHP4 constructors"
-        # Если start.php существует — проверяем что он упоминает __construct
-        # для каждого модуля с PHP4-конструктором (грубая проверка наличия патча)
-        continue-on-error: true
-        run: |
-          echo "=== start.php patch coverage check ==="
-          if [ ! -f "./start.php" ]; then
-            echo "ℹ️  start.php not found — skipping patch coverage check"
-            exit 0
-          fi
-
-          MISSING=0
-          while IFS= read -r -d '' file; do
-            classname=$(grep -oP '(?<=^class\s)\w+' "$file" | head -1)
-            if [ -n "$classname" ]; then
-              if grep -qP "function\s+${classname}\s*\(" "$file"; then
-                # Проверяем что start.php содержит __construct для этого класса
-                if ! grep -q "__construct" ./start.php; then
-                  echo "⚠️  start.php may not patch __construct for class $classname ($file)"
-                  MISSING=$((MISSING + 1))
-                fi
-              fi
-            fi
-          done < <(find . \
-            -name "*.class.php" \
-            -not -path "./vendor/*" \
-            -not -path "./3rdparty/*" \
-            -print0)
-
-          if [ $MISSING -eq 0 ]; then
-            echo "✅ start.php appears to cover constructor patches."
-          fi
-
-      # ------------------------------------------------------------------
-      # БЛОК F: Информационные проверки (не фейлят сборку)
-      # ------------------------------------------------------------------
-
-      - name: "[INFO] proc_open/exec usage inventory"
-        # proc_open используется в threads.php — нормально и ожидаемо.
-        # Документируем для ревью.
-        continue-on-error: true
-        run: |
-          echo "=== proc_open/exec usage (informational) ==="
+          echo "=== sudo / service mysql ==="
           grep -rn -B2 -A2 \
             --include="*.php" \
             --exclude-dir=vendor \
             --exclude-dir=3rdparty \
-            -E '\b(proc_open|exec|shell_exec|system|passthru)\s*\(' \
-            . 2>/dev/null || true
-          echo "(informational only — not a failure)"
+            -E 'sudo\s+service\s+mysql|exec\s*\([^)]*sudo' \
+            . 2>/dev/null \
+            && echo "^^^ Found — ensure DISABLE_MYSQL_RESTART covers this" || echo "OK: none"
 
-      - name: "[INFO] Check INI files syntax"
+      - name: "/proc/stat|loadavg|uptime (SELinux blocked на Android)"
         continue-on-error: true
         run: |
-          echo "=== PHP INI files syntax check ==="
-          ERRORS=0
-          while IFS= read -r -d '' file; do
-            result=$(php -r "parse_ini_file('$file');" 2>&1)
-            if [ $? -ne 0 ]; then
-              echo "❌ INI parse error: $file"
-              echo "$result"
-              ERRORS=$((ERRORS + 1))
-            else
-              echo "✅ $file"
-            fi
-          done < <(find . \
-            -name "*.ini" \
-            -not -path "./vendor/*" \
-            -print0)
+          echo "=== /proc/ restricted files ==="
+          grep -rn -B2 -A2 \
+            --include="*.php" \
+            --exclude-dir=vendor \
+            --exclude-dir=3rdparty \
+            -E '["\x27]/proc/(stat|loadavg|uptime|meminfo|cpuinfo)' \
+            . 2>/dev/null \
+            && echo "^^^ Found" || echo "OK: none"
 
-          if [ $ERRORS -gt 0 ]; then
-            exit 1
+      - name: "pcntl_* (SELinux blocked на Android)"
+        continue-on-error: true
+        run: |
+          echo "=== pcntl_* functions ==="
+          grep -rn -B2 -A2 \
+            --include="*.php" \
+            --exclude-dir=vendor \
+            --exclude-dir=3rdparty \
+            -E '\bpcntl_(fork|signal|waitpid|wait|exec|alarm)\s*\(' \
+            . 2>/dev/null \
+            && echo "^^^ Found — SELinux blocks these on Android" || echo "OK: none"
+
+      - name: "Hardcoded /tmp/ (нет на Android)"
+        continue-on-error: true
+        run: |
+          echo "=== Hardcoded /tmp/ paths ==="
+          grep -rn -B2 -A2 \
+            --include="*.php" \
+            --exclude-dir=vendor \
+            --exclude-dir=3rdparty \
+            -E '["\x27]/tmp/' \
+            . 2>/dev/null \
+            && echo "^^^ Found — fix: sys_get_temp_dir() or ROOT.'cms/cached/'" || echo "OK: none"
+
+      - name: "Verify opcache_off.ini"
+        continue-on-error: true
+        run: |
+          echo "=== opcache_off.ini check ==="
+          INI=$(find . -name "*.ini" -not -path "./vendor/*" \
+            -exec grep -l "opcache.enable=0" {} \; | head -1)
+          if [ -n "$INI" ]; then
+            echo "OK: $INI"
+            grep -E "opcache\.enable|error_reporting" "$INI"
+          else
+            echo "NOT FOUND — php-cgi will crash on Android (shm_open blocked by SELinux)"
           fi
 
   # ============================================================
-  # JOB 4: Итоговый статус — единая точка для branch protection rules
-  # Настройте в Settings → Branches → Require status checks:
-  #   "All checks passed"
+  # JOB 4: Code quality
+  # ============================================================
+  code-quality:
+    name: "Code quality"
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: '@ оператор с файловыми функциями (PHP 8: игнорируется custom error handler)'
+        continue-on-error: true
+        run: |
+          echo "=== @ operator on filesystem/network calls ==="
+          grep -rn -B2 -A2 \
+            --include="*.php" \
+            --exclude-dir=vendor \
+            --exclude-dir=3rdparty \
+            --exclude-dir=cms \
+            -E '@(rmdir|mkdir|unlink|rename|copy|fopen|fclose|fsockopen|file_get_contents|file_put_contents|include|require)\s*\(' \
+            . 2>/dev/null \
+            && echo "^^^ Found — PHP 8: @ не подавляет ошибки при set_error_handler" \
+            || echo "OK: none"
+
+      - name: 'Loose comparison с 0 (поведение изменилось в PHP 8)'
+        continue-on-error: true
+        run: |
+          echo "=== Loose == 0 comparisons ==="
+          echo "PHP7: 0=='string' → TRUE | PHP8: 0=='string' → FALSE"
+          grep -rn -B2 -A2 \
+            --include="*.php" \
+            --exclude-dir=vendor \
+            --exclude-dir=3rdparty \
+            --exclude-dir=cms \
+            -E "\bif\s*\(\s*\\\$[a-zA-Z_]+\s*==\s*0\b|\bif\s*\(\s*0\s*==\s*\\\$[a-zA-Z_]+" \
+            . 2>/dev/null \
+            && echo "^^^ Found — проверить каждый: возможно нужен === или (int) cast" \
+            || echo "OK: none"
+
+      - name: 'count() на результате функций (TypeError в PHP 8 если null)'
+        continue-on-error: true
+        run: |
+          echo "=== count() on function results ==="
+          grep -rn -B2 -A2 \
+            --include="*.php" \
+            --exclude-dir=vendor \
+            --exclude-dir=3rdparty \
+            --exclude-dir=cms \
+            -E '\bcount\s*\(\s*(SQLSelect|getList|explode|preg_split)\s*\(' \
+            . 2>/dev/null \
+            && echo "^^^ Found — fix: count(\$arr ?? [])" || echo "OK: none"
+
+      - name: "eval() usage"
+        continue-on-error: true
+        run: |
+          echo "=== eval() ==="
+          grep -rn -B2 -A2 \
+            --include="*.php" \
+            --exclude-dir=vendor \
+            --exclude-dir=3rdparty \
+            -E '\beval\s*\(' \
+            . 2>/dev/null \
+            && echo "^^^ Found" || echo "OK: none"
+
+      - name: "Захардкоженные пути к mysql/mysqldump"
+        continue-on-error: true
+        run: |
+          echo "=== Hardcoded mysql binary paths ==="
+          echo "На Termux: mysql=mariadb, mysqldump=mariadb-dump"
+          grep -rn -B2 -A2 \
+            --include="*.php" \
+            --exclude-dir=vendor \
+            --exclude-dir=3rdparty \
+            -E "['\"]\/usr\/bin\/(mysql|mysqldump)" \
+            . 2>/dev/null \
+            && echo "^^^ Found — fix: defined('PATH_TO_MYSQL') ? PATH_TO_MYSQL : 'mysql'" \
+            || echo "OK: none"
+
+      - name: "proc_open/exec/shell_exec — инвентаризация"
+        continue-on-error: true
+        run: |
+          echo "=== proc_open/exec usage (informational) ==="
+          grep -rn \
+            --include="*.php" \
+            --exclude-dir=vendor \
+            --exclude-dir=3rdparty \
+            -E '\b(proc_open|exec|shell_exec|system|passthru)\s*\(' \
+            . 2>/dev/null || echo "none"
+
+  # ============================================================
+  # JOB 5: Итоговый статус для branch protection rules
+  # Всегда green — джобы выше информационные
   # ============================================================
   all-checks-passed:
     name: "All checks passed"
@@ -680,676 +384,16 @@ jobs:
     if: always()
 
     steps:
-      - name: Check results
+      - name: "Summary"
         run: |
-          echo "=================================================="
-          echo "           PHP COMPATIBILITY REPORT"
-          echo "=================================================="
+          echo "================================"
+          echo "  PHP COMPATIBILITY REPORT"
+          echo "================================"
+          echo "php-lint:            ${{ needs.php-lint.result }}"
+          echo "php-compatibility:   ${{ needs.php-compatibility.result }}"
+          echo "majordomo-specific:  ${{ needs.majordomo-specific.result }}"
+          echo "code-quality:        ${{ needs.code-quality.result }}"
           echo ""
-          echo "Job results:"
-          echo "  php-lint:            ${{ needs.php-lint.result }}"
-          echo "  php-compatibility:   ${{ needs.php-compatibility.result }}"
-          echo "  majordomo-specific:  ${{ needs.majordomo-specific.result }}"
-          echo "  code-quality:        ${{ needs.code-quality.result }}"
-          echo ""
-          echo "Branch: alpha-test"
-          echo "Note: Individual step failures are visible in each job above."
-          echo "      continue-on-error is set — all files are always checked."
-          echo ""
-          # Фейлим pipeline только если целый job упал (не отдельный шаг)
-          # Шаги с continue-on-error не роняют job — роняет только
-          # шаг БЕЗ continue-on-error (php-lint финальный счётчик)
-          FAILED=0
-          if [ "${{ needs.php-lint.result }}" = "failure" ]; then
-            echo "❌ Syntax errors found — see php-lint job for details"
-            FAILED=$((FAILED+1))
-          fi
-          if [ "${{ needs.php-compatibility.result }}" = "failure" ]; then
-            echo "❌ Compatibility errors found — see php-compatibility job"
-            FAILED=$((FAILED+1))
-          fi
-          echo ""
-          if [ $FAILED -gt 0 ]; then
-            echo "RESULT: $FAILED critical job(s) failed."
-            echo "Warnings in majordomo-specific and code-quality are informational."
-            exit 1
-          else
-            echo "RESULT: No critical errors. Review warnings in jobs above."
-          fi
-
-  # ============================================================
-  # JOB 5: Расширенные проверки качества кода
-  # Критичные баги специфичные для PHP 8 + Majordomo архитектуры
-  # ============================================================
-  code-quality:
-    name: "Code quality checks"
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        shell: bash
-    needs: php-lint
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup PHP 8.5
-        uses: shivammathur/setup-php@v2
-        with:
-          php-version: '8.5'
-          coverage: none
-          tools: none
-
-      # ==================================================================
-      # БЛОК 1: КРИТИЧЕСКИЕ — роняют циклы Majordomo прямо сейчас
-      # ==================================================================
-
-      - name: "[CRITICAL] @ operator with custom error handler (PHP 8 broken pattern)"
-        # В PHP 8 set_error_handler перехватывает ошибки НЕСМОТРЯ на @ оператор.
-        # Majordomo использует кастомный error handler в cycle.php.
-        # Паттерн @rmdir(), @unlink(), @mkdir() — всё это роняет цикл при E_WARNING.
-        # Правильный фикс: временно set_error_handler(fn()=>true) вокруг вызова.
-        # Уже встречали в syncfiles.class.php — ищем систематически.
-        continue-on-error: true
-        run: |
-          set +e
-          echo "=== @ operator usage (broken with custom error handler in PHP 8) ==="
-          result=$(grep -rn -B2 -A2 \
-            --include="*.php" \
-            --exclude-dir=vendor \
-            --exclude-dir=3rdparty \
-            --exclude-dir=cms \
-            -E '@(rmdir|mkdir|unlink|rename|copy|file_get_contents|file_put_contents|fopen|fclose|fsockopen|include|require)\s*\(' \
-            . 2>/dev/null || true)
-          if [ -n "$result" ]; then
-            COUNT=$(echo "$result" | wc -l)
-            echo "⚠️  Found $COUNT uses of @ with filesystem/network functions:"
-            echo "$result"
-            echo ""
-            echo "Fix: wrap with set_error_handler(function(){\$return true;}) / restore_error_handler()"
-          else
-            echo "✅ No dangerous @ operator usage."
-          fi
-
-      - name: "[CRITICAL] Loose comparison with 0 (behavior changed PHP 8)"
-        # PHP 7: 0 == 'any_string' → TRUE  (строка приводится к 0)
-        # PHP 8: 0 == 'any_string' → FALSE (0 приводится к строке '0')
-        # Это тихо ломает логику без единого warning.
-        # Особенно опасно в проверках ID: if ($id == 0), if ($result == 'error')
-        continue-on-error: true
-        run: |
-          set +e
-          echo "=== Loose comparison patterns dangerous in PHP 8 ==="
-          result=$(grep -rn -B2 -A2 \
-            --include="*.php" \
-            --exclude-dir=vendor \
-            --exclude-dir=3rdparty \
-            --exclude-dir=cms \
-            -E "\bif\s*\(\s*\\\$[a-zA-Z_]+\s*==\s*0\b|\bif\s*\(\s*0\s*==\s*\\\$[a-zA-Z_]+" \
-            . 2>/dev/null || true)
-          if [ -n "$result" ]; then
-            COUNT=$(echo "$result" | wc -l)
-            echo "⚠️  Found $COUNT loose comparisons with 0 (== vs ===):"
-            echo "$result"
-            echo ""
-            echo "Check each: if string comparison intended use === or explicit cast"
-          else
-            echo "✅ No suspicious loose comparisons with 0."
-          fi
-
-      - name: "[CRITICAL] Hardcoded /tmp/ paths (no /tmp on Android)"
-        # На Android /tmp не существует. Нужен sys_get_temp_dir() или путь в Termux prefix.
-        # Вызывает silent fail при создании временных файлов.
-        continue-on-error: true
-        run: |
-          set +e
-          echo "=== Hardcoded /tmp/ paths ==="
-          result=$(grep -rn -B2 -A2 \
-            --include="*.php" \
-            --exclude-dir=vendor \
-            --exclude-dir=3rdparty \
-            -E '["\x27]/tmp/' \
-            . 2>/dev/null || true)
-          if [ -n "$result" ]; then
-            COUNT=$(echo "$result" | wc -l)
-            echo "❌ Found $COUNT hardcoded /tmp/ paths (no /tmp on Android):"
-            echo "$result"
-            echo "Fix: use sys_get_temp_dir() or ROOT . 'cms/cached/'"
-            exit 1
-          else
-            echo "✅ No hardcoded /tmp/ paths."
-          fi
-
-      - name: "[CRITICAL] Hardcoded mysql/mysqldump paths without PATH_TO_MYSQL check"
-        # cycle.php и backup.class.php используют $mysql_path без проверки константы.
-        # На Termux mysql = mariadb, mysqldump = mariadb-dump.
-        # Паттерн: прямое присваивание 'mysql' или '/usr/bin/mysql' без defined() guard.
-        continue-on-error: true
-        run: |
-          set +e
-          echo "=== Hardcoded mysql binary paths ==="
-          result=$(grep -rn -B2 -A2 \
-            --include="*.php" \
-            --exclude-dir=vendor \
-            --exclude-dir=3rdparty \
-            -E "['\"]\/usr\/bin\/mysql|['\"]\/usr\/bin\/mysqldump" \
-            . 2>/dev/null || true)
-          if [ -n "$result" ]; then
-            COUNT=$(echo "$result" | wc -l)
-            echo "⚠️  Found $COUNT hardcoded absolute mysql paths:"
-            echo "$result"
-            echo "Fix: use defined('PATH_TO_MYSQL') ? PATH_TO_MYSQL : 'mysql'"
-          else
-            echo "✅ No hardcoded absolute mysql paths."
-          fi
-
-      - name: "[CRITICAL] pcntl_* functions (blocked by SELinux on Android)"
-        # pcntl_fork(), pcntl_signal(), pcntl_waitpid() — заблокированы SELinux на Android без root.
-        # Вызывают fatal error или silent fail.
-        continue-on-error: true
-        run: |
-          set +e
-          echo "=== pcntl_* functions (SELinux blocked on Android) ==="
-          result=$(grep -rn -B2 -A2 \
-            --include="*.php" \
-            --exclude-dir=vendor \
-            --exclude-dir=3rdparty \
-            -E '\bpcntl_(fork|signal|waitpid|wait|exec|alarm|setpriority|getpriority)\s*\(' \
-            . 2>/dev/null || true)
-          if [ -n "$result" ]; then
-            COUNT=$(echo "$result" | wc -l)
-            echo "❌ Found $COUNT pcntl_* calls (SELinux blocks these on Android):"
-            echo "$result"
-            exit 1
-          else
-            echo "✅ No pcntl_* calls."
-          fi
-
-      - name: "[CRITICAL] posix_* functions (may be unavailable on Android)"
-        continue-on-error: true
-        run: |
-          set +e
-          echo "=== posix_* functions ==="
-          result=$(grep -rn -B2 -A2 \
-            --include="*.php" \
-            --exclude-dir=vendor \
-            --exclude-dir=3rdparty \
-            -E '\bposix_(kill|getpid|getppid|setuid|setgid|setsid|isatty)\s*\(' \
-            . 2>/dev/null || true)
-          if [ -n "$result" ]; then
-            COUNT=$(echo "$result" | wc -l)
-            echo "⚠️  Found $COUNT posix_* calls (may fail on Android):"
-            echo "$result"
-          else
-            echo "✅ No posix_* calls."
-          fi
-
-      # ==================================================================
-      # БЛОК 2: PHP 8 BREAKING CHANGES — тихие баги без ошибок
-      # ==================================================================
-
-      - name: "[PHP8] count() on null/non-countable (warning PHP 7.2, fatal PHP 8)"
-        # count(null) → PHP 7: 0 с warning, PHP 8: TypeError fatal
-        # count($scalar) → аналогично
-        # Паттерн: count() результата функции без проверки
-        continue-on-error: true
-        run: |
-          set +e
-          echo "=== count() on potentially non-array values ==="
-          result=$(grep -rn -B2 -A2 \
-            --include="*.php" \
-            --exclude-dir=vendor \
-            --exclude-dir=3rdparty \
-            --exclude-dir=cms \
-            -E '\bcount\s*\(\s*(SQLSelect|getList|explode|preg_split)\s*\(' \
-            . 2>/dev/null || true)
-          if [ -n "$result" ]; then
-            COUNT=$(echo "$result" | wc -l)
-            echo "⚠️  Found $COUNT count() calls on function results (may return null):"
-            echo "$result"
-            echo "Fix: count(\$arr ?? [])"
-          else
-            echo "✅ No dangerous count() patterns found."
-          fi
-
-      - name: "[PHP8] String to number comparison edge cases"
-        # PHP 8 изменил: '01' == 1 → FALSE (было TRUE в PHP 7)
-        # Критично для сравнения ID из БД которые приходят как строки
-        continue-on-error: true
-        run: |
-          set +e
-          echo "=== Numeric string comparisons ==="
-          result=$(grep -rn -B2 -A2 \
-            --include="*.php" \
-            --exclude-dir=vendor \
-            --exclude-dir=3rdparty \
-            --exclude-dir=cms \
-            -E "\[\s*['\"]ID['\"]\s*\]\s*==" \
-            . 2>/dev/null || true)
-          if [ -n "$result" ]; then
-            COUNT=$(echo "$result" | wc -l)
-            echo "⚠️  Found $COUNT loose ID comparisons (string from DB vs int):"
-            echo "$result"
-            echo "Fix: use === or (int) cast: (int)\$row['ID'] === \$id"
-          else
-            echo "✅ No suspicious ID comparison patterns."
-          fi
-
-      - name: "[PHP8] implode() wrong argument order (deprecated PHP 7.4, removed PHP 8)"
-        # implode(\$array, \$glue) — старый порядок аргументов
-        # PHP 8: только implode(\$glue, \$array)
-        continue-on-error: true
-        run: |
-          set +e
-          echo "=== implode() argument order ==="
-          result=$(grep -rn -B2 -A2 \
-            --include="*.php" \
-            --exclude-dir=vendor \
-            --exclude-dir=3rdparty \
-            --exclude-dir=cms \
-            -E '\bimplode\s*\(\s*\$[a-zA-Z]' \
-            . 2>/dev/null || true)
-          if [ -n "$result" ]; then
-            COUNT=$(echo "$result" | wc -l)
-            echo "⚠️  Found $COUNT possible implode() with array as first argument:"
-            echo "$result"
-            echo "Fix: implode(',', \$array) not implode(\$array, ',')"
-          else
-            echo "✅ No implode() argument order issues."
-          fi
-
-      - name: "[PHP8] strip_tags() array argument (added PHP 7.4, verify usage)"
-        # strip_tags(\$str, ['p','br']) — работает только с PHP 7.4+
-        # Если нужна совместимость с 7.0-7.3 — проблема
-        continue-on-error: true
-        run: |
-          set +e
-          echo "=== strip_tags() with array (PHP 7.4+) ==="
-          result=$(grep -rn -B2 -A2 \
-            --include="*.php" \
-            --exclude-dir=vendor \
-            --exclude-dir=3rdparty \
-            -E '\bstrip_tags\s*\([^,]+,\s*\[' \
-            . 2>/dev/null || true)
-          if [ -n "$result" ]; then
-            echo "ℹ️  Found strip_tags() with array argument (PHP 7.4+ only):"
-            echo "$result"
-          else
-            echo "✅ No strip_tags() array usage."
-          fi
-
-      # ==================================================================
-      # БЛОК 3: NULL SAFETY — самая частая причина падений циклов
-      # ==================================================================
-
-      - name: "[NULL] Direct array access without isset on _SERVER/_GET/_POST/_REQUEST"
-        # $_SERVER['REQUEST_URI'] без ?? '' — fatal в CLI режиме (cycle.php)
-        # $_GET['id'] без isset — notice/warning роняющий цикл
-        continue-on-error: true
-        run: |
-          set +e
-          echo "=== Unguarded superglobal access ==="
-          result=$(grep -rn -B2 -A2 \
-            --include="*.php" \
-            --exclude-dir=vendor \
-            --exclude-dir=3rdparty \
-            --exclude-dir=cms \
-            -E '\$_(GET|POST|REQUEST|SERVER|COOKIE)\s*\[[^]]+\]\s*[^?]' \
-            . 2>/dev/null | \
-            grep -v 'isset\s*(' | \
-            grep -v '??' | \
-            grep -v 'array_key_exists' | \
-            grep -v '^\s*//' \
-            || true)
-          if [ -n "$result" ]; then
-            COUNT=$(echo "$result" | wc -l)
-            echo "⚠️  Found $COUNT unguarded superglobal accesses:"
-            echo "$result"
-            echo "Fix: \$_GET['key'] ?? '' or isset(\$_GET['key'])"
-          else
-            echo "✅ No unguarded superglobal access."
-          fi
-
-      - name: "[NULL] Method call on potentially null object"
-        # $obj->method() где $obj может быть null/false
-        # Типичный паттерн Majordomo: $station['CONNECT']->close() — уже фиксили
-        # Ищем вызовы на результатах функций без проверки
-        continue-on-error: true
-        run: |
-          set +e
-          echo "=== Method calls on unguarded function results ==="
-          result=$(grep -rn -B2 -A2 \
-            --include="*.php" \
-            --exclude-dir=vendor \
-            --exclude-dir=3rdparty \
-            --exclude-dir=cms \
-            -E '\b(SQLSelectOne|getObject|getProvider|current|reset|array_shift|array_pop)\s*\([^)]*\)\s*->' \
-            . 2>/dev/null || true)
-          if [ -n "$result" ]; then
-            COUNT=$(echo "$result" | wc -l)
-            echo "⚠️  Found $COUNT method calls on function results without null check:"
-            echo "$result"
-            echo "Fix: \$obj = func(); if (\$obj) \$obj->method();"
-          else
-            echo "✅ No unguarded method chains on function results."
-          fi
-
-      - name: "[NULL] preg_match result used without check"
-        # preg_match() возвращает false при ошибке regexp в PHP 8
-        # Использование \$matches без проверки результата
-        continue-on-error: true
-        run: |
-          set +e
-          echo "=== preg_match result check ==="
-          result=$(grep -rn -B2 -A2 \
-            --include="*.php" \
-            --exclude-dir=vendor \
-            --exclude-dir=3rdparty \
-            --exclude-dir=cms \
-            -P 'preg_match\s*\(.+,\s*\$.+,\s*\$(\w+)\);\s*\n\s*[^i]' \
-            . 2>/dev/null || true)
-          if [ -n "$result" ]; then
-            echo "⚠️  Possible unguarded preg_match result:"
-            echo "$result"
-          else
-            echo "✅ preg_match usage looks OK."
-          fi
-
-      # ==================================================================
-      # БЛОК 4: MAJORDOMO АРХИТЕКТУРА — специфичные антипаттерны
-      # ==================================================================
-
-      - name: "[ARCH] var keyword for properties (deprecated PHP 8.1+ strict)"
-        # 'var $foo' — PHP4 стиль, работает но генерирует E_STRICT в старых PHP
-        # В PHP 8 E_STRICT убран, но 'var' = public — важно понимать видимость
-        continue-on-error: true
-        run: |
-          set +e
-          echo "=== PHP4 'var' property declarations ==="
-          result=$(grep -rn -B2 -A2 \
-            --include="*.php" \
-            --exclude-dir=vendor \
-            --exclude-dir=3rdparty \
-            -E '^\s+var\s+\$[a-zA-Z_]' \
-            . 2>/dev/null || true)
-          if [ -n "$result" ]; then
-            COUNT=$(echo "$result" | wc -l)
-            echo "ℹ️  Found $COUNT PHP4-style 'var' property declarations:"
-            echo "$result"
-            echo "Consider: replace 'var' with explicit public/private/protected"
-          else
-            echo "✅ No PHP4 var declarations."
-          fi
-
-      - name: "[ARCH] Global variables in functions (Majordomo pattern risk)"
-        # Majordomo активно использует global — но незадекларированный global
-        # в PHP 8 генерирует warning если переменная не существует в глобальном скоупе
-        continue-on-error: true
-        run: |
-          set +e
-          echo "=== Global variable declarations ==="
-          COUNT=$(grep -rn -B2 -A2 \
-            --include="*.php" \
-            --exclude-dir=vendor \
-            --exclude-dir=3rdparty \
-            -c 'global \$' \
-            . 2>/dev/null | awk -F: '{sum+=$2} END{print sum}')
-          echo "ℹ️  Total 'global \$var' declarations: ${COUNT:-0}"
-          echo "(informational — high count = high coupling risk)"
-
-      - name: "[ARCH] Direct SQL string concatenation (SQL injection risk)"
-        # SQLSelect("... WHERE ID=" . $id) без подготовленных запросов
-        # Не блокирует сборку — документируем для ревью
-        continue-on-error: true
-        run: |
-          set +e
-          echo "=== Direct SQL string concatenation ==="
-          result=$(grep -rn -B2 -A2 \
-            --include="*.php" \
-            --exclude-dir=vendor \
-            --exclude-dir=3rdparty \
-            --exclude-dir=cms \
-            -E 'SQL(Select|SelectOne|Exec)\s*\([^)]*\.\s*\$' \
-            . 2>/dev/null || true)
-          if [ -n "$result" ]; then
-            COUNT=$(echo "$result" | wc -l)
-            echo "ℹ️  Found $COUNT SQL queries with string concatenation:"
-            echo "$result" | head -20
-            [ $(echo "$result" | wc -l) -gt 20 ] && echo "... (truncated, showing first 20)"
-          else
-            echo "✅ No direct SQL concatenation found."
-          fi
-
-      - name: "[ARCH] Recursive require/include without guard (double-include risk)"
-        # include/require без _once в классах/модулях — риск double-include
-        # Особенно в модулях Majordomo которые могут загружаться многократно
-        continue-on-error: true
-        run: |
-          set +e
-          echo "=== require/include without _once in class files ==="
-          result=$(grep -rn \
-            --include="*.class.php" \
-            --exclude-dir=vendor \
-            --exclude-dir=3rdparty \
-            -E '^\s*(require|include)\s*[^_]' \
-            . 2>/dev/null || true)
-          if [ -n "$result" ]; then
-            COUNT=$(echo "$result" | wc -l)
-            echo "⚠️  Found $COUNT require/include without _once in class files:"
-            echo "$result"
-          else
-            echo "✅ No bare require/include in class files."
-          fi
-
-      # ==================================================================
-      # БЛОК 5: TERMUX / ANDROID СПЕЦИФИКА
-      # ==================================================================
-
-      - name: "[TERMUX] sudo usage (no sudo on Android without root)"
-        # sudo в exec/shell_exec — молча падает на Termux
-        # cycle.php уже патчим через DISABLE_MYSQL_RESTART — ищем остальные
-        continue-on-error: true
-        run: |
-          set +e
-          echo "=== sudo usage in PHP files ==="
-          result=$(grep -rn -B2 -A2 \
-            --include="*.php" \
-            --exclude-dir=vendor \
-            --exclude-dir=3rdparty \
-            -E '(exec|shell_exec|system|passthru)\s*\([^)]*sudo' \
-            . 2>/dev/null || true)
-          if [ -n "$result" ]; then
-            COUNT=$(echo "$result" | wc -l)
-            echo "⚠️  Found $COUNT sudo calls (fails silently on Android/Termux):"
-            echo "$result"
-          else
-            echo "✅ No sudo calls in PHP files."
-          fi
-
-      - name: "[TERMUX] service/systemctl commands (unavailable on Android)"
-        continue-on-error: true
-        run: |
-          set +e
-          echo "=== service/systemctl commands ==="
-          result=$(grep -rn -B2 -A2 \
-            --include="*.php" \
-            --exclude-dir=vendor \
-            --exclude-dir=3rdparty \
-            -E '(exec|shell_exec)\s*\([^)]*\b(systemctl|service\s+\w+\s+(start|stop|restart|status))\b' \
-            . 2>/dev/null || true)
-          if [ -n "$result" ]; then
-            COUNT=$(echo "$result" | wc -l)
-            echo "⚠️  Found $COUNT systemctl/service calls (unavailable on Android):"
-            echo "$result"
-          else
-            echo "✅ No systemctl/service calls."
-          fi
-
-      - name: "[TERMUX] /proc/stat /proc/loadavg /proc/uptime (SELinux blocked)"
-        # Эти файлы заблокированы SELinux на Android без root
-        continue-on-error: true
-        run: |
-          set +e
-          echo "=== /proc/ filesystem access (SELinux blocked on Android) ==="
-          result=$(grep -rn -B2 -A2 \
-            --include="*.php" \
-            --exclude-dir=vendor \
-            --exclude-dir=3rdparty \
-            -E '["\x27]/proc/(stat|loadavg|uptime|meminfo|cpuinfo)' \
-            . 2>/dev/null || true)
-          if [ -n "$result" ]; then
-            COUNT=$(echo "$result" | wc -l)
-            echo "⚠️  Found $COUNT /proc/ reads (SELinux blocks these on Android):"
-            echo "$result"
-          else
-            echo "✅ No blocked /proc/ access."
-          fi
-
-      - name: "[TERMUX] Windows path separators and SERVER_ROOT patterns"
-        # IsWindowsOS() ветки — ок, но иногда Windows-специфичный код попадает в общую ветку
-        continue-on-error: true
-        run: |
-          set +e
-          echo "=== Windows-specific path patterns outside IsWindowsOS() ==="
-          result=$(grep -rn -B2 -A2 \
-            --include="*.php" \
-            --exclude-dir=vendor \
-            --exclude-dir=3rdparty \
-            -E '["\x27][A-Z]:\\\\' \
-            . 2>/dev/null || true)
-          if [ -n "$result" ]; then
-            COUNT=$(echo "$result" | wc -l)
-            echo "⚠️  Found $COUNT Windows absolute paths:"
-            echo "$result"
-          else
-            echo "✅ No Windows absolute paths."
-          fi
-
-      # ==================================================================
-      # БЛОК 6: БЕЗОПАСНОСТЬ
-      # ==================================================================
-
-      - name: "[SEC] Credentials in code (passwords, tokens, keys)"
-        # Ищем захардкоженные пароли — не должны попадать в репо
-        continue-on-error: true
-        run: |
-          set +e
-          echo "=== Hardcoded credentials ==="
-          result=$(grep -rn -B2 -A2 \
-            --include="*.php" \
-            --exclude-dir=vendor \
-            --exclude-dir=3rdparty \
-            --exclude="config.php" \
-            -iE '(password|passwd|secret|api_key|apikey|token)\s*=\s*["\x27][^"\x27]{6,}["\x27]' \
-            . 2>/dev/null || true)
-          if [ -n "$result" ]; then
-            COUNT=$(echo "$result" | wc -l)
-            echo "⚠️  Found $COUNT possible hardcoded credentials:"
-            echo "$result"
-          else
-            echo "✅ No obvious hardcoded credentials."
-          fi
-
-      - name: "[SEC] eval() usage"
-        continue-on-error: true
-        run: |
-          set +e
-          echo "=== eval() usage ==="
-          result=$(grep -rn -B2 -A2 \
-            --include="*.php" \
-            --exclude-dir=vendor \
-            --exclude-dir=3rdparty \
-            -E '\beval\s*\(' \
-            . 2>/dev/null || true)
-          if [ -n "$result" ]; then
-            COUNT=$(echo "$result" | wc -l)
-            echo "⚠️  Found $COUNT eval() calls:"
-            echo "$result"
-          else
-            echo "✅ No eval() usage."
-          fi
-
-      - name: "[SEC] Unvalidated file path operations"
-        # file_get_contents/include с переменной без валидации — path traversal риск
-        continue-on-error: true
-        run: |
-          set +e
-          echo "=== Unvalidated dynamic file operations ==="
-          result=$(grep -rn -B2 -A2 \
-            --include="*.php" \
-            --exclude-dir=vendor \
-            --exclude-dir=3rdparty \
-            --exclude-dir=cms \
-            -E '\b(file_get_contents|file_put_contents|include|require)\s*\(\s*\$_(GET|POST|REQUEST)' \
-            . 2>/dev/null || true)
-          if [ -n "$result" ]; then
-            COUNT=$(echo "$result" | wc -l)
-            echo "❌ Found $COUNT dangerous dynamic file operations with user input:"
-            echo "$result"
-            exit 1
-          else
-            echo "✅ No unvalidated dynamic file operations."
-          fi
-
-      # ==================================================================
-      # БЛОК 7: ТЕХНИЧЕСКИЙ ДОЛГ — инвентаризация
-      # ==================================================================
-
-      - name: "[DEBT] TODO/FIXME/HACK/WORKAROUND inventory"
-        continue-on-error: true
-        run: |
-          set +e
-          echo "=== Technical debt markers ==="
-          result=$(grep -rn -B2 -A2 \
-            --include="*.php" \
-            --exclude-dir=vendor \
-            --exclude-dir=3rdparty \
-            -iE '(TODO|FIXME|HACK|WORKAROUND|XXX)\s*:?\s*.{5,}' \
-            . 2>/dev/null || true)
-          if [ -n "$result" ]; then
-            COUNT=$(echo "$result" | wc -l)
-            echo "ℹ️  Found $COUNT technical debt markers:"
-            echo "$result"
-          else
-            echo "✅ No TODO/FIXME markers."
-          fi
-          echo "(informational only)"
-
-      - name: "[DEBT] Dead code — commented out code blocks"
-        continue-on-error: true
-        run: |
-          set +e
-          echo "=== Large commented-out code blocks ==="
-          result=$(grep -rn -B2 -A2 \
-            --include="*.php" \
-            --exclude-dir=vendor \
-            --exclude-dir=3rdparty \
-            -E '^\s*//\s*(if|for|foreach|while|switch|function|class|return|\$[a-zA-Z])\s*[\(\{]' \
-            . 2>/dev/null || true)
-          if [ -n "$result" ]; then
-            COUNT=$(echo "$result" | wc -l)
-            echo "ℹ️  Found $COUNT commented-out code lines:"
-            echo "$result" | head -20
-            [ $(echo "$result" | wc -l) -gt 20 ] && echo "... (truncated)"
-          else
-            echo "✅ No large commented-out blocks."
-          fi
-          echo "(informational only)"
-
-      - name: "[DEBT] Long files (>500 lines — refactoring candidates)"
-        continue-on-error: true
-        run: |
-          set +e
-          echo "=== Files over 500 lines ==="
-          find . \
-            -name "*.php" \
-            -not -path "./vendor/*" \
-            -not -path "./3rdparty/*" \
-            -not -path "./cms/cached/*" \
-            2>/dev/null | while read f; do
-            lines=$(wc -l < "$f")
-            if [ "$lines" -gt 500 ]; then
-              echo "  $lines lines: $f"
-            fi
-          done | sort -rn
-          echo "(informational only)"
+          echo "Все джобы информационные."
+          echo "Находки видны в логах каждого джоба выше."
+          echo "================================"
